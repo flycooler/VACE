@@ -1084,5 +1084,6 @@ if __name__ == '__main__':
         vace_tag.set_callbacks()
         demo.queue(status_update_rate=1).launch(server_name=args.server_name,
                                                 server_port=int(args.server_port),
-                                                show_api=False, show_error=True,
+                                                #show_api=False, show_error=True,
+                                                show_error=True,
                                                 debug=True)
