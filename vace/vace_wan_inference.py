@@ -33,9 +33,6 @@ EXAMPLE_PROMPT = {
     }
 }
 
-
-
-
 def validate_args(args):
     # Basic check
     assert args.ckpt_dir is not None, "Please specify the checkpoint directory."

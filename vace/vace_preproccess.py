@@ -122,18 +122,123 @@ def proccess():
 def postproccess():
     pass
 
+def _prepare_input_data(args, input_params):
+    """根据输入参数准备数据字典"""
+    input_data = copy.deepcopy(input_params)
+    video_paths = args.video.split(',') if args.video else []
+    image_paths = args.image.split(',') if args.image else []
+
+    def read_video_helper(video_path):
+        frames, fps, width, height, num_frames = read_video_frames(video_path, use_type='cv2', info=True)
+        assert frames is not None, f"Video read error: {video_path}"
+        return frames, fps
+
+    if 'video' in input_params or 'frames' in input_params:
+        assert video_paths, "Please set video or check configs"
+        frames, fps = read_video_helper(video_paths[0])
+        if 'frames' in input_params:
+            input_data['frames'] = frames
+        if 'video' in input_params:
+            input_data['video'] = args.video
+
+    if 'frames_2' in input_params and len(video_paths) >= 2:
+        frames_2, _ = read_video_helper(video_paths[1])
+        input_data['frames_2'] = frames_2
+
+    def read_image_helper(image_path):
+        image, _, _ = read_image(image_path, use_type='pil', info=True)
+        assert image is not None, f"Image read error: {image_path}"
+        return image
+
+    if 'image' in input_params:
+        assert image_paths, "Please set image or check configs"
+        input_data['image'] = read_image_helper(image_paths[0])
+
+    if 'image_2' in input_params and len(image_paths) >= 2:
+        input_data['image_2'] = read_image_helper(image_paths[1])
+
+    if 'images' in input_params:
+        assert image_paths, "Please set image or check configs"
+        input_data['images'] = [read_image_helper(p) for p in image_paths]
+
+    if 'mask' in input_params and args.mask:
+        mask, _, _ = read_mask(args.mask.split(",")[0], use_type='pil', info=True)
+        assert mask is not None, "Mask read error"
+        input_data['mask'] = mask
+
+    # 简化其他参数的赋值
+    arg_map = {'bbox': 'bbox', 'label': 'label', 'caption': 'caption', 'mode': 'mode', 'direction': 'direction', 'expand_ratio': 'expand_ratio', 'expand_num': 'expand_num'}
+    for param, arg_name in arg_map.items():
+        if param in input_params and getattr(args, arg_name) is not None:
+            value = getattr(args, arg_name)
+            if isinstance(value, str) and ',' in value and param in ['label', 'direction']:
+                value = value.split(',')
+            elif param == 'bbox' and isinstance(value, list) and len(value) == 1:
+                value = value[0]
+            input_data[param] = value
+
+    if 'mask_cfg' in input_params and args.maskaug_mode is not None:
+        mask_cfg = {"mode": args.maskaug_mode}
+        if args.maskaug_ratio is not None:
+            mask_cfg["kwargs"] = {'expand_ratio': args.maskaug_ratio, 'expand_iters': 5}
+        input_data['mask_cfg'] = mask_cfg
+
+    return input_data, locals().get('fps', None)
+
+def _save_results(results, output_params, pre_save_dir, task_name, save_fps):
+    """保存处理结果"""
+    ret_data = {}
+    
+    def save_video(data, path_suffix, key_name):
+        if data is not None:
+            save_path = os.path.join(pre_save_dir, f'{path_suffix}-{task_name}.mp4')
+            save_one_video(save_path, data, fps=save_fps)
+            print(f"Save frames result to {save_path}")
+            ret_data[key_name] = save_path
+
+    def save_image(data, path_suffix, key_name=None):
+        if data is not None:
+            save_path = os.path.join(pre_save_dir, f'{path_suffix}-{task_name}.png')
+            save_one_image(save_path, data, use_type='pil')
+            print(f"Save image result to {save_path}")
+            if key_name:
+                ret_data[key_name] = save_path
+
+    output_map = {
+        'frames': ('src_video', lambda r: r['frames'] if isinstance(r, dict) else r, 'src_video'),
+        'masks': ('src_mask', lambda r: r['masks'] if isinstance(r, dict) else r, 'src_mask'),
+        'image': ('src_ref_image', lambda r: r['image'] if isinstance(r, dict) else r, 'src_ref_images'),
+        'mask': ('src_mask', lambda r: r['mask'] if isinstance(r, dict) else r, None),
+    }
+
+    for param, (suffix, data_extractor, ret_key) in output_map.items():
+        if param in output_params:
+            data = data_extractor(results)
+            if param in ['frames', 'masks']:
+                save_video(data, suffix, ret_key)
+            else:
+                save_image(data, suffix, ret_key)
+
+    if 'images' in output_params:
+        ret_images = results.get('images') if isinstance(results, dict) else results
+        if ret_images:
+            saved_paths = []
+            for i, img in enumerate(ret_images):
+                if img:
+                    save_path = os.path.join(pre_save_dir, f'src_ref_image_{i}-{task_name}.png')
+                    save_one_image(save_path, img, use_type='pil')
+                    print(f"Save image result to {save_path}")
+                    saved_paths.append(save_path)
+            if saved_paths:
+                ret_data['src_ref_images'] = ','.join(saved_paths)
+
+    return ret_data
+
 def main(args):
     args = argparse.Namespace(**args) if isinstance(args, dict) else args
     args = validate_args(args)
 
     task_name = args.task
-    video_path = args.video
-    image_path = args.image
-    mask_path = args.mask
-    bbox = args.bbox
-    caption = args.caption
-    label = args.label
-    save_fps = args.save_fps
 
     # init class
     task_cfg = copy.deepcopy(VACE_PREPROCCESS_CONFIGS)[task_name]
@@ -142,82 +247,14 @@ def main(args):
     output_params = task_cfg.pop("OUTPUTS")
 
     # input data
-    fps = None
-    input_data = copy.deepcopy(input_params)
-    if 'video' in input_params:
-        assert video_path is not None, "Please set video or check configs"
-        frames, fps, width, height, num_frames = read_video_frames(video_path.split(",")[0], use_type='cv2',  info=True)
-        assert frames is not None, "Video read error"
-        input_data['frames'] = frames
-        input_data['video'] = video_path
-    if 'frames' in input_params:
-        assert video_path is not None, "Please set video or check configs"
-        frames, fps, width, height, num_frames = read_video_frames(video_path.split(",")[0], use_type='cv2', info=True)
-        assert frames is not None, "Video read error"
-        input_data['frames'] = frames
-    if 'frames_2' in input_params:
-        # assert video_path is not None and len(video_path.split(",")[1]) >= 2, "Please set two videos or check configs"
-        if  len(video_path.split(",")) >= 2:
-            frames, fps, width, height, num_frames = read_video_frames(video_path.split(",")[1], use_type='cv2', info=True)
-            assert frames is not None, "Video read error"
-            input_data['frames_2'] = frames
-    if 'image' in input_params:
-        assert image_path is not None, "Please set image or check configs"
-        image, width, height = read_image(image_path.split(",")[0], use_type='pil', info=True)
-        assert image is not None, "Image read error"
-        input_data['image'] = image
-    if 'image_2' in input_params:
-        # assert image_path is not None and len(image_path.split(",")[1]) >= 2, "Please set two images or check configs"
-        if len(image_path.split(",")) >= 2:
-            image, width, height = read_image(image_path.split(",")[1], use_type='pil', info=True)
-            assert image is not None, "Image read error"
-            input_data['image_2'] = image
-    if 'images' in input_params:
-        assert image_path is not None, "Please set image or check configs"
-        images = [ read_image(path, use_type='pil', info=True)[0] for path in image_path.split(",") ]
-        input_data['images'] = images
-    if 'mask' in input_params:
-        # assert mask_path is not None, "Please set mask or check configs"
-        if mask_path is not None:
-            mask, width, height = read_mask(mask_path.split(",")[0], use_type='pil', info=True)
-            assert mask is not None, "Mask read error"
-            input_data['mask'] = mask
-    if 'bbox' in input_params:
-        # assert bbox is not None, "Please set bbox"
-        if bbox is not None:
-            input_data['bbox'] = bbox[0] if len(bbox) == 1 else bbox
-    if 'label' in input_params:
-        # assert label is not None, "Please set label or check configs"
-        input_data['label'] = label.split(',') if label is not None else None
-    if 'caption' in input_params:
-        # assert caption is not None, "Please set caption or check configs"
-        input_data['caption'] = caption
-    if 'mode' in input_params:
-        input_data['mode'] = args.mode
-    if 'direction' in input_params:
-        if args.direction is not None:
-            input_data['direction'] = args.direction.split(',')
-    if 'expand_ratio' in input_params:
-        if args.expand_ratio is not None:
-            input_data['expand_ratio'] = args.expand_ratio
-    if 'expand_num' in input_params:
-        # assert args.expand_num is not None, "Please set expand_num or check configs"
-        if args.expand_num is not None:
-            input_data['expand_num'] = args.expand_num
-    if 'mask_cfg' in input_params:
-        # assert args.maskaug_mode is not None and args.maskaug_ratio is not None, "Please set maskaug_mode and maskaug_ratio or check configs"
-        if args.maskaug_mode is not None:
-            if args.maskaug_ratio is not None:
-                input_data['mask_cfg'] = {"mode": args.maskaug_mode, "kwargs": {'expand_ratio': args.maskaug_ratio, 'expand_iters': 5}}
-            else:
-                input_data['mask_cfg'] = {"mode": args.maskaug_mode}
+    input_data, fps = _prepare_input_data(args, input_params)
 
     # processing
     pre_ins = getattr(annotators, class_name)(cfg=task_cfg, device=f'cuda:{os.getenv("RANK", 0)}')
     results = pre_ins.forward(**input_data)
 
     # output data
-    save_fps = fps if fps is not None else save_fps
+    save_fps = fps if fps is not None else args.save_fps
     if args.pre_save_dir is None:
         pre_save_dir = os.path.join('processed', task_name, time.strftime('%Y-%m-%d-%H-%M-%S', time.localtime(time.time())))
     else:
@@ -225,48 +262,7 @@ def main(args):
     if not os.path.exists(pre_save_dir):
         os.makedirs(pre_save_dir)
 
-    ret_data = {}
-    if 'frames' in output_params:
-        frames =  results['frames'] if isinstance(results, dict) else results
-        if frames is not None:
-            save_path = os.path.join(pre_save_dir, f'src_video-{task_name}.mp4')
-            save_one_video(save_path, frames, fps=save_fps)
-            print(f"Save frames result to {save_path}")
-            ret_data['src_video'] = save_path
-    if 'masks' in output_params:
-        frames = results['masks'] if isinstance(results, dict) else results
-        if frames is not None:
-            save_path = os.path.join(pre_save_dir, f'src_mask-{task_name}.mp4')
-            save_one_video(save_path, frames, fps=save_fps)
-            print(f"Save frames result to {save_path}")
-            ret_data['src_mask'] = save_path
-    if 'image' in output_params:
-        ret_image =  results['image'] if isinstance(results, dict) else results
-        if ret_image is not None:
-            save_path = os.path.join(pre_save_dir, f'src_ref_image-{task_name}.png')
-            save_one_image(save_path, ret_image, use_type='pil')
-            print(f"Save image result to {save_path}")
-            ret_data['src_ref_images'] = save_path
-    if 'images' in output_params:
-        ret_images = results['images'] if isinstance(results, dict) else results
-        if ret_images is not None:
-            src_ref_images = []
-            for i, img in enumerate(ret_images):
-                if img is not None:
-                    save_path = os.path.join(pre_save_dir, f'src_ref_image_{i}-{task_name}.png')
-                    save_one_image(save_path, img, use_type='pil')
-                    print(f"Save image result to {save_path}")
-                    src_ref_images.append(save_path)
-            if len(src_ref_images) > 0:
-                ret_data['src_ref_images'] = ','.join(src_ref_images)
-            else:
-                ret_data['src_ref_images'] = None
-    if 'mask' in output_params:
-        ret_image =  results['mask'] if isinstance(results, dict) else results
-        if ret_image is not None:
-            save_path = os.path.join(pre_save_dir, f'src_mask-{task_name}.png')
-            save_one_image(save_path, ret_image, use_type='pil')
-            print(f"Save mask result to {save_path}")
+    ret_data = _save_results(results, output_params, pre_save_dir, task_name, save_fps)
     return ret_data
 
 
